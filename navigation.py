@@ -44,6 +44,9 @@ class Grid:
     def manhattan(self, a: int, b: int) -> int:
         return abs(a % self.width - b % self.width) + abs(a // self.width - b // self.width)
 
+    def chebyshev(self, a: int, b: int) -> int:
+        return max(abs(a % self.width - b % self.width), abs(a // self.width - b // self.width))
+
 
 def dijkstra(grid: Grid, enter_cost: list[float], sources: list[int]) -> tuple[list[float], list[int]]:
     """Turns until ready on each cell, starting from any source, plus predecessors."""

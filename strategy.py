@@ -16,43 +16,59 @@ BASE_COST = 6
 TRADE_RATIO = 3
 VISION = [(dx, dy) for dx in range(-3, 4) for dy in range(-3, 4) if abs(dx) + abs(dy) <= 3]
 
+# Tuned values come from tune.py candidate 3 (16 teams, +22.9 ± 11.7 gold over 12 games).
 WEIGHTS: dict[str, float] = {
     # Expected entry cost of an unseen tile: 70% plain, 30% mountain or crater.
-    "unknown_cost": 1.6,
+    "unknown_cost": 2.09,
     # Value of one kg of iron in gold, while we want to invest and once we don't.
-    "iron_value_needed": 0.8,
+    "iron_value_needed": 1.854,
     "iron_value_spare": 1 / 3,
     # Gold-equivalent cost of one banked kg of iron when deciding to spend it.
     "iron_gold_equiv": 3.0,
-    "worker_gold_per_turn": 0.35,
+    "worker_gold_per_turn": 0.504,
     "spawn_warmup_turns": 15,
     "spawn_on_deposit_min": 4,
     "max_workers": 12,
     "iron_reserve": 0,
     "invest_min_turns_left": 60,
-    # 1 = skip non-urgent bases that would delay a worker that pays for itself.
-    "save_for_workers": 0,
+    # Skip non-urgent bases that would delay a paying worker while we have fewer workers than this.
+    "save_workers_until": 3,
+    # Spawn wherever the worker stands before this turn (2 = spawn on turns 0 and 1).
+    "spawn_anywhere_until_turn": 2,
     # 1 = trade carried gold for iron at a base when a paying worker is short of iron.
     "trade_gold_for_workers": 0,
     # Build a base instead of walking home when it saves at least this many turns.
-    "base_min_savings": 6,
+    "base_min_savings": 10,
     "base_min_turns_left": 40,
     # 1 = build a base next to a far, rich gold deposit before mining it, not after the first load.
     "base_first": 0,
     "base_first_min_amount": 8,
-    "explore_value": 3.0,
+    # 1 = send a worker to build next to known gold clusters far from our bases.
+    "base_cluster": 1,
+    "base_cluster_min_gold": 15,
+    "base_cluster_min_dist": 5,
+    "build_fail_limit": 2,
+    "explore_value": 3.775,
     "explore_dist_offset": 6.0,
     "explore_candidates": 15,
     "explore_spread": 7,
     "explore_spread_penalty": 0.3,
-    "explore_min_turns_left": 30,
+    "explore_min_turns_left": 37,
     "center_bias": 0.5,
-    "stale_turns": 40.0,
-    "contention_penalty": 0.5,
-    "stickiness": 1.2,
+    # Extra explore distance per tile of Chebyshev distance from the center point.
+    "explore_center_pull": 0.305,
+    # 1 = explore only when a worker has no mining job at all.
+    "explore_last": 1,
+    # 1 = carried gold counts in job values, and going home competes as a job.
+    "value_carried": 1,
+    # 1 = send the worker closest to known iron whenever the bank is short of the next build.
+    "iron_runner": 1,
+    "stale_turns": 194.7,
+    "contention_penalty": 0.79,
+    "stickiness": 1.535,
     # Carrying workers go home when their best task scores below this.
     "return_threshold": 0.15,
-    "endgame_buffer": 1,
+    "endgame_buffer": 2,
     "iron_dump_turns_left": 60,
     "blacklist_turns": 60,
 }
@@ -87,15 +103,21 @@ class Planner:
         self.assignments: dict[str, Task] = {}
         self.build_intents: dict[str, int] = {}
         self.last_mines: dict[str, tuple[int, int]] = {}
+        self.last_builds: list[int] = []
+        self.build_failures: dict[int, int] = {}
+        self.bad_sites: set[int] = set()
+        self.iron_runner: Optional[str] = None
 
     def decide(self, view: MarsView, max_turns: int) -> ActionsByEntity:
         started = time.monotonic()
         self.memory.update(view)
         self._detect_failed_mines()
+        self._detect_failed_builds()
         plan = TurnPlan(self, view, max_turns)
         actions = plan.run()
         self.assignments = plan.assignments
         self.last_mines = plan.mines
+        self.last_builds = plan.builds
         elapsed = time.monotonic() - started
         if elapsed > 0.4:
             print(f"Planning turn {view['turn']} took {elapsed * 1000:.0f} ms")
@@ -114,6 +136,14 @@ class Planner:
                     and carried_kg(worker) <= carried_before < worker["inventoryCapacity"]):
                 mem.blacklist[cell] = mem.turn + int(self.weights["blacklist_turns"])
 
+    def _detect_failed_builds(self) -> None:
+        # A build that left no base fails for a reason we can't see; stop retrying that site.
+        for site in self.last_builds:
+            if site not in self.memory.friendly_bases:
+                self.build_failures[site] = self.build_failures.get(site, 0) + 1
+                if self.build_failures[site] >= self.weights["build_fail_limit"]:
+                    self.bad_sites.add(site)
+
 
 class TurnPlan:
     """One turn's decisions. Distance fields are rebuilt each turn from memory."""
@@ -127,9 +157,11 @@ class TurnPlan:
         self.iron_budget = bank["iron"]
         self.workers = sorted(mem.my_units, key=lambda unit: unit["unitId"])
         self.spawn_cost = spawn_cost(len(self.workers) - 1)
+        # Iron promised to workers walking to a planned base site.
+        self.reserved_iron = BASE_COST * len(planner.build_intents)
         investing = self.turns_left > self.w["invest_min_turns_left"]
-        iron_target = BASE_COST + (self.spawn_cost if self._spawn_pays() else 0)
-        self.iron_needed = investing and self.iron_budget < iron_target
+        self.iron_target = BASE_COST + (self.spawn_cost if self._spawn_pays() else 0)
+        self.iron_needed = investing and self.iron_budget < self.iron_target
         self.iron_value = self.w["iron_value_needed"] if self.iron_needed else self.w["iron_value_spare"]
 
         self.cost = self._enter_costs()
@@ -141,6 +173,7 @@ class TurnPlan:
         self.actions: ActionsByEntity = {}
         self.assignments: dict[str, Task] = {}
         self.mines: dict[str, tuple[int, int]] = {}
+        self.builds: list[int] = []
         self.spawned = False
         # Iron from gold trades submitted this turn; it reaches the bank after the next deposit.
         self.pending_iron = 0
@@ -150,12 +183,22 @@ class TurnPlan:
         for worker in self.workers:
             if self.mem.turn < worker["readyOnTurn"]:
                 continue
-            action = self._local_action(worker)
+            # A bug in one worker's logic only costs that worker its turn.
+            try:
+                action = self._local_action(worker)
+            except Exception as error:
+                print(f"Turn {self.mem.turn}: worker {worker['unitId']} failed: {error!r}; passing")
+                action = {"type": "pass"}
             if action is None:
                 pending.append(worker)
             else:
                 self.actions[worker["unitId"]] = action
-        self._assign(pending)
+        try:
+            self._assign(pending)
+        except Exception as error:
+            print(f"Turn {self.mem.turn}: assignment failed: {error!r}; unassigned workers pass")
+        for worker in pending:
+            self.actions.setdefault(worker["unitId"], {"type": "pass"})
         return self.actions
 
     # Distance fields
@@ -187,11 +230,14 @@ class TurnPlan:
 
         site = self.planner.build_intents.pop(uid, None)
         if site is not None:
-            if site == pos and self.iron_budget >= BASE_COST and self._valid_site(pos, builder_here=True):
-                return self._build_base()
+            self.reserved_iron -= BASE_COST
+            if site == pos and self._free_iron() >= BASE_COST and self._valid_site(pos, builder_here=True):
+                return self._build_base(pos)
             if site != pos and self._valid_site(site):
-                self.planner.build_intents[uid] = site
-                return self._move_towards(worker, site)
+                return self._plan_build(worker, site)
+
+        if mem.turn < w["spawn_anywhere_until_turn"] and self._can_spawn():
+            return self._spawn()
 
         if pos in mem.friendly_bases:
             if carried:
@@ -225,7 +271,7 @@ class TurnPlan:
         """Walk to the nearest base, or build one here if that is much faster."""
         w = self.w
         walk = self.base_dist[pos] + 1
-        if self.iron_budget >= BASE_COST:
+        if self._free_iron() >= BASE_COST:
             options = [(2.0, pos)] if self._valid_site(pos, builder_here=True) else []
             options += [(self.cost[n] + 2, n) for n in self.mem.grid.neighbors[pos] if self._valid_site(n)]
             if options:
@@ -235,10 +281,7 @@ class TurnPlan:
                 # Late in the match, a base may be the only way to bank this load.
                 rescue = walk + w["endgame_buffer"] > self.turns_left >= alt
                 if worth_it or rescue:
-                    if site == pos:
-                        return self._build_base()
-                    self.planner.build_intents[worker["unitId"]] = site
-                    return self._move_towards(worker, site)
+                    return self._build_base(pos) if site == pos else self._plan_build(worker, site)
         return self._step_home(pos)
 
     def _step_home(self, pos: int) -> Action:
@@ -269,9 +312,12 @@ class TurnPlan:
                 and self.turns_left > w["invest_min_turns_left"]
                 and payoff > self.spawn_cost * w["iron_gold_equiv"])
 
+    def _free_iron(self) -> int:
+        return self.iron_budget - self.reserved_iron
+
     def _can_spawn(self) -> bool:
         return (not self.spawned and self._spawn_pays()
-                and self.iron_budget - self.spawn_cost >= self.w["iron_reserve"])
+                and self._free_iron() - self.spawn_cost >= self.w["iron_reserve"])
 
     def _spawn(self) -> Action:
         self.spawned = True
@@ -280,23 +326,30 @@ class TurnPlan:
 
     def _base_affordable(self) -> bool:
         """Bank iron covers a base, plus the next worker when saving for one."""
-        reserve = self.spawn_cost if self.w["save_for_workers"] and self._spawn_pays() else 0
-        return self.iron_budget >= BASE_COST + reserve
+        saving = len(self.workers) < self.w["save_workers_until"] and self._spawn_pays()
+        return self._free_iron() >= BASE_COST + (self.spawn_cost if saving else 0)
 
     def _iron_short(self, inv: Inventory) -> bool:
         return (bool(self.w["trade_gold_for_workers"]) and self._spawn_pays()
                 and self.iron_budget + self.pending_iron + inv["iron"] < self.spawn_cost)
 
-    def _build_base(self) -> Action:
+    def _build_base(self, site: int) -> Action:
         self.iron_budget -= BASE_COST
+        self.builds.append(site)
         return {"type": "build-base"}
+
+    def _plan_build(self, worker: Unit, site: int) -> Action:
+        """Head for a base site, holding its iron until the worker gets there."""
+        self.planner.build_intents[worker["unitId"]] = site
+        self.reserved_iron += BASE_COST
+        return self._move_towards(worker, site)
 
     def _dump_iron(self) -> bool:
         return not self.iron_needed and self.turns_left <= self.w["iron_dump_turns_left"]
 
     def _valid_site(self, i: int, builder_here: bool = False) -> bool:
         mem = self.mem
-        if mem.terrain[i] != EMPTY or i in mem.deposits or i in mem.base_cells:
+        if mem.terrain[i] != EMPTY or i in mem.deposits or i in mem.base_cells or i in self.planner.bad_sites:
             return False
         if mem.unit_counts[i] > (1 if builder_here else 0):
             return False
@@ -309,9 +362,13 @@ class TurnPlan:
         """Greedy assignment: repeatedly give the best-scoring (worker, task) pair its task."""
         reserved: dict[int, int] = {}
         explore_targets: list[int] = []
-        frontier = self._frontier() if self.turns_left > self.w["explore_min_turns_left"] else []
-        options = {worker["unitId"]: self._explore_options(worker, frontier) for worker in workers}
         remaining = list(workers)
+        for special in (self._send_cluster_builder, self._send_iron_runner):
+            worker = special(remaining)
+            if worker is not None:
+                remaining.remove(worker)
+        frontier = self._frontier() if self.turns_left > self.w["explore_min_turns_left"] else []
+        options = {worker["unitId"]: self._explore_options(worker, frontier) for worker in remaining}
         while remaining:
             best: Optional[tuple[float, Unit, Task, int]] = None
             for worker in remaining:
@@ -324,19 +381,19 @@ class TurnPlan:
             remaining.remove(worker)
             uid = worker["unitId"]
             pos = self.mem.position(worker)
-            if carried_kg(worker) and score < self.w["return_threshold"]:
+            kind, target = task
+            if kind == "return" or (not self.w["value_carried"] and carried_kg(worker)
+                                    and score < self.w["return_threshold"]):
                 self.actions[uid] = self._return_home(worker, pos)
                 continue
-            kind, target = task
             self.assignments[uid] = task
             if kind == "deposit":
                 reserved[target] = reserved.get(target, 0) + gain
                 site = None if target == pos else self._base_first_site(worker, target)
                 if site == pos:
-                    self.actions[uid] = self._build_base()
+                    self.actions[uid] = self._build_base(pos)
                 elif site is not None:
-                    self.planner.build_intents[uid] = site
-                    self.actions[uid] = self._move_towards(worker, site)
+                    self.actions[uid] = self._plan_build(worker, site)
                 else:
                     self.actions[uid] = self._mine(worker, pos) if target == pos else self._move_towards(worker, target)
             else:
@@ -362,6 +419,84 @@ class TurnPlan:
         sites = [n for n in mem.grid.neighbors[i] if dist[n] < INF and self._valid_site(n, builder_here=n == pos)]
         return min(sites, key=lambda n: dist[n]) if sites else None
 
+    def _send_cluster_builder(self, workers: list[Unit]) -> Optional[Unit]:
+        """Send one worker to build next to the best known gold cluster far from our bases."""
+        w, mem = self.w, self.mem
+        if (not w["base_cluster"] or self.planner.build_intents or not workers
+                or self.turns_left < w["base_min_turns_left"] or not self._base_affordable()):
+            return None
+        golds = [(i, d.amount) for i, d in mem.deposits.items() if d.resource == "gold" and mem.mineable(i)]
+        choices: list[tuple[float, int, Unit]] = []
+        for i, _ in golds:
+            if self.base_dist[i] < w["base_cluster_min_dist"]:
+                continue
+            nearby = sum(amount for j, amount in golds if mem.grid.chebyshev(i, j) <= 3)
+            if nearby < w["base_cluster_min_gold"]:
+                continue
+            for worker in workers:
+                travel = self.path(worker)[0][i]
+                if travel < self.turns_left - 50:
+                    choices.append((nearby / (travel + 5), i, worker))
+        for _, i, worker in sorted(choices, key=lambda choice: -choice[0]):
+            site = self._best_site(i, worker, golds)
+            if site is not None:
+                pos = mem.position(worker)
+                self.actions[worker["unitId"]] = self._build_base(pos) if site == pos else self._plan_build(worker, site)
+                return worker
+        return None
+
+    def _best_site(self, center: int, worker: Unit, golds: list[tuple[int, int]]) -> Optional[int]:
+        """Site within 3 of center scoring claimed gold (Manhattan 2) plus half the gold within 3 steps."""
+        w, mem = self.w, self.mem
+        grid = mem.grid
+        pos = mem.position(worker)
+        dist = self.path(worker)[0]
+        cx, cy = grid.xy(center)
+        best, best_score = None, -INF
+        for y in range(max(0, cy - 3), min(grid.height, cy + 4)):
+            for x in range(max(0, cx - 3), min(grid.width, cx + 4)):
+                site = grid.index(x, y)
+                if (dist[site] == INF or self.base_dist[site] < w["base_cluster_min_dist"]
+                        or not self._valid_site(site, builder_here=site == pos)):
+                    continue
+                score = -0.5 * grid.chebyshev(pos, site)
+                for j, amount in golds:
+                    if grid.manhattan(site, j) <= 2:
+                        score += amount
+                    elif grid.chebyshev(site, j) <= 3:
+                        score += 0.5 * amount
+                if score > best_score:
+                    best, best_score = site, score
+        return best
+
+    def _send_iron_runner(self, workers: list[Unit]) -> Optional[Unit]:
+        """While the bank is short of the next build, the worker closest to known iron fetches it."""
+        mem = self.mem
+        if not self.w["iron_runner"] or not self.iron_needed or len(self.workers) < 2:
+            self.planner.iron_runner = None
+            return None
+        runner = self.planner.iron_runner
+        free_ids = {worker["unitId"] for worker in workers}
+        if runner in {worker["unitId"] for worker in self.workers} and runner not in free_ids:
+            return None  # The runner is busy with a fixed rule this turn (mining, returning, ...).
+        irons = [i for i, d in mem.deposits.items() if d.resource == "iron" and mem.mineable(i)]
+        pool = [worker for worker in workers if worker["unitId"] == runner] or workers
+        options = [(self.path(worker)[0][i], i, worker) for worker in pool for i in irons]
+        if not options:
+            return None
+        travel, i, worker = min(options, key=lambda option: option[0])
+        if travel >= self.turns_left - 30:
+            return None
+        uid = worker["unitId"]
+        pos = mem.position(worker)
+        self.planner.iron_runner = uid
+        if self.iron_budget + inventory(worker)["iron"] >= self.iron_target:
+            self.actions[uid] = self._return_home(worker, pos)
+        else:
+            self.assignments[uid] = ("deposit", i)
+            self.actions[uid] = self._mine(worker, pos) if i == pos else self._move_towards(worker, i)
+        return worker
+
     def _best_task(self, worker: Unit, reserved: dict[int, int], explore_targets: list[int],
                    explore_options: list[tuple[float, int]]) -> Optional[tuple[float, Task, int]]:
         w, mem = self.w, self.mem
@@ -370,6 +505,13 @@ class TurnPlan:
         space = worker["inventoryCapacity"] - carried_kg(worker)
         cheap_base = self._base_affordable() and self.turns_left >= w["base_min_turns_left"]
         best: Optional[tuple[float, Task, int]] = None
+        carried_value = 0.0
+        if w["value_carried"]:
+            inv = inventory(worker)
+            carried_value = inv["gold"] + inv["iron"] * self.iron_value
+            pos = mem.position(worker)
+            if carried_value and self.base_dist[pos] < INF:
+                best = (carried_value / (self.base_dist[pos] + 1), ("return", pos), 0)
 
         for i, deposit in mem.deposits.items():
             if dist[i] == INF or not mem.mineable(i):
@@ -383,13 +525,15 @@ class TurnPlan:
             gain = min(deposit.amount - reserved.get(i, 0), space, int(spare))
             if gain <= 0:
                 continue
-            value = gain * (1.0 if deposit.resource == "gold" else self.iron_value)
+            value = carried_value + gain * (1.0 if deposit.resource == "gold" else self.iron_value)
             score = value / (dist[i] + gain + back) * self._freshness(i, deposit) * self._contention(i)
             if previous == ("deposit", i):
                 score *= w["stickiness"]
             if best is None or score > best[0]:
                 best = (score, ("deposit", i), gain)
 
+        if w["explore_last"] and best is not None:
+            return best
         for score, i in explore_options:
             if any(mem.grid.manhattan(i, t) <= w["explore_spread"] for t in explore_targets):
                 score *= w["explore_spread_penalty"]
@@ -418,9 +562,15 @@ class TurnPlan:
                 for i, t in enumerate(mem.terrain) if t == UNKNOWN]
 
     def _explore_options(self, worker: Unit, frontier: list[tuple[int, float]]) -> list[tuple[float, int]]:
-        w = self.w
+        w, mem = self.w, self.mem
         dist = self.path(worker)[0]
-        scored = ((w["explore_value"] * info / (dist[i] + w["explore_dist_offset"]), i)
+        pull = w["explore_center_pull"]
+        center = None
+        if pull and mem.center:
+            x0, y0, x1, y1 = mem.center
+            center = mem.grid.index((x0 + x1) // 2, (y0 + y1) // 2)
+        scored = ((w["explore_value"] * info / (dist[i] + w["explore_dist_offset"]
+                                                + (pull * mem.grid.chebyshev(i, center) if center is not None else 0)), i)
                   for i, info in frontier if dist[i] < INF)
         return nlargest(int(w["explore_candidates"]), scored)
 

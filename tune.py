@@ -5,7 +5,7 @@ seed is replayed with sides swapped, so map luck cancels out. A candidate's scor
 per-game gold difference (candidate teams minus default teams). The best candidates get more games
 on new seeds, and the last stage uses held-out seeds so the winner's reported edge is not inflated.
 
-Usage: python3 tune.py [candidates] [output.json] [--teams=N] [--quick]
+Usage: python3 tune.py [candidates] [output.json] [--teams=N] [--rng=N] [--quick]
 """
 import json
 import os
@@ -21,20 +21,22 @@ from strategy import WEIGHTS, Planner  # noqa: E402
 
 TEAMS = 6
 
-# name: (low, high, integer?). Exploration and travel dominate worker time, so most knobs are there.
+# name: (low, high, integer?). The first 16-team run favored less exploring, longer trust in old
+# sightings, and more stickiness; the rest cover the switches adopted from Marissa's bot.
 SPACE = {
-    "explore_value": (1.0, 6.0, False),
-    "explore_dist_offset": (2.0, 15.0, False),
-    "explore_spread": (3, 12, True),
-    "explore_spread_penalty": (0.1, 0.8, False),
+    "explore_value": (0.3, 4.0, False),
+    "explore_center_pull": (0.0, 0.8, False),
     "explore_min_turns_left": (10, 120, True),
-    "center_bias": (0.0, 2.0, False),
-    "stale_turns": (10.0, 150.0, False),
-    "unknown_cost": (1.0, 3.0, False),
-    "return_threshold": (0.05, 0.4, False),
+    "stale_turns": (30.0, 200.0, False),
+    "unknown_cost": (1.0, 2.5, False),
     "contention_penalty": (0.0, 1.5, False),
-    "stickiness": (1.0, 1.6, False),
+    "stickiness": (1.0, 1.7, False),
     "base_min_savings": (3, 12, True),
+    "base_cluster_min_gold": (8, 24, True),
+    "base_cluster_min_dist": (3, 8, True),
+    "save_workers_until": (2, 6, True),
+    "iron_value_needed": (0.5, 2.5, False),
+    "worker_gold_per_turn": (0.2, 0.6, False),
 }
 
 
@@ -66,9 +68,10 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     quick = "--quick" in sys.argv
     teams = next((int(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--teams=")), TEAMS)
+    rng_seed = next((int(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--rng=")), 0)
     n = int(args[0]) if args else 160
     out = args[1] if len(args) > 1 else "tune_results.json"
-    rng = random.Random(0)
+    rng = random.Random(rng_seed)
     # Candidate 0 is the defaults, a control that should score about zero.
     candidates = [{}] + [sample(rng) for _ in range(n - 1)]
     diffs = {i: [] for i in range(n)}
