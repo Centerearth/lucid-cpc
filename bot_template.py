@@ -5,6 +5,7 @@ import os
 from heapq import heappop, heappush
 from collections.abc import Sequence
 from typing import Optional
+import strategy
 from bot_client import (
     ActionsByEntity,
     BaseLocation,
@@ -19,7 +20,6 @@ from bot_client import (
     OreState,
     Resource,
     TerritoryState,
-    mars_view,
 )
 
 # Make sure to set your team token!
@@ -28,17 +28,8 @@ API_BASE_URL = os.environ.get("LUCID_API_BASE_URL", "http://localhost:5173")
 
 
 def calculate_actions(gameState: BotState, identity: Identity) -> ActionsByEntity:
-    view = mars_view(gameState)
-    if view is None:
-        return {}
-
-    # Strategy goes here.
-
-    return {
-        worker["unitId"]: {"type": "pass"}
-        for worker in view["units"]
-        if worker["teamId"] == identity["teamId"]
-    }
+    # Strategy lives in strategy.py (memory.py and navigation.py support it).
+    return strategy.calculate_actions(gameState, identity)
 
 
 # Game helpers. Feel free to use, discard, or modify.
